@@ -1,6 +1,7 @@
 
-os.environ["ANONYMIZED_TELEMETRY"] = "False"
+
 import os
+os.environ["ANONYMIZED_TELEMETRY"] = "False"
 from pathlib import Path
 from typing import List
 
