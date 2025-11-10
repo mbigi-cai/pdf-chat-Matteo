@@ -1,25 +1,32 @@
 # streamlit_app.py
-# Chat su indice Chroma già esistente (nessuna re-indicizzazione a runtime)
+# App RAG su indice Chroma già esistente (SOLO LETTURA)
+# - MMR + keyword boost + MultiQuery (fallback)
+# - Sanity check dell’indice per chunk “vuoti”
+# - Nessuna reindicizzazione in runtime
 
 from __future__ import annotations
 import os
+os.environ["ANONYMIZED_TELEMETRY"] = "False"  # disattiva telemetria Chroma
+
 from pathlib import Path
 from typing import List
 
-# disattiva telemetria Chroma in Cloud
-os.environ["ANONYMIZED_TELEMETRY"] = "False"
-
 import streamlit as st
+
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_chroma import Chroma
-from chromadb.config import Settings as ChromaSettings
-from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.documents import Document
+from langchain_core.prompts import ChatPromptTemplate
+from langchain.retrievers.multi_query import MultiQueryRetriever
 
-# ------------------------- Config pagina -------------------------
+# ============================
+# Config base pagina
+# ============================
 st.set_page_config(page_title="PDF Chat • Chroma", page_icon="📄", layout="wide")
 
-# ------------------------- Gate password (opzionale) -------------------------
+# ----------------------------
+# Accesso opzionale con password
+# ----------------------------
 if "APP_PASSWORD" in st.secrets:
     st.session_state._auth = st.session_state.get("_auth", False)
     if not st.session_state._auth:
@@ -34,39 +41,47 @@ if "APP_PASSWORD" in st.secrets:
         if not st.session_state._auth:
             st.stop()
 
-# ------------------------- OpenAI key -------------------------
+# ----------------------------
+# Chiave OpenAI (Secrets o ENV)
+# ----------------------------
 OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", os.environ.get("OPENAI_API_KEY"))
 if not OPENAI_API_KEY:
-    st.warning("⚠️ OPENAI_API_KEY non trovata nei Secrets o nelle variabili d'ambiente.")
+    st.warning("⚠️ OPENAI_API_KEY non trovato nei Secrets o nelle variabili d'ambiente.")
 
-# ------------------------- UI base -------------------------
-st.title("📄 Chat con PDF — indice Chroma esistente")
-st.caption("Questa app **non** ricostruisce l'indice. Usa una cartella Chroma già pronta.")
-
-DEFAULT_CHROMA_DIR = "chroma_db_v2_text_embedding_3_large_single"  # nome cartella nel repo
+# ============================
+# UI e impostazioni
+# ============================
+DEFAULT_CHROMA_DIR = "chroma_db_v2_text_embedding_3_large_single"  # <-- nome cartella nel repo
 
 with st.sidebar:
     st.header("⚙️ Impostazioni")
     persist_dir_input = st.text_input("Cartella Chroma (persist_directory)", value=DEFAULT_CHROMA_DIR)
-    k = st.slider("Passaggi dal retriever (k)", min_value=2, max_value=10, value=5)
+    k = st.slider("Passaggi dal retriever (k)", min_value=5, max_value=20, value=12)
     temperature = st.slider("Creatività (temperature)", 0.0, 1.0, 0.0, 0.1)
 
-# ------------------------- Prompt RAG -------------------------
+st.title("📄 Chat con PDF — indice Chroma esistente")
+st.caption("Questa app **non** ricostruisce l’indice. Usa una cartella Chroma già pronta e coerente con il modello di embedding.")
+
+# ============================
+# Prompt RAG
+# ============================
 SYSTEM_PROMPT = (
     "Sei un assistente che risponde in modo conciso e accurato usando SOLO il contenuto "
     "dei documenti forniti. Se l'informazione non è nei documenti, dillo esplicitamente. "
     "Riporta sempre riferimenti a pagina/source."
 )
-PROMPT_TEMPLATE = ChatPromptTemplate.from_messages([
+PROMPT_TMPL = ChatPromptTemplate.from_messages([
     ("system", SYSTEM_PROMPT),
-    ("human", "Domanda: {question}\n\nContesto (estratti):\n{context}\n\nRispondi in italiano."),
+    ("human", "Domanda: {question}\n\nContesto (estratti):\n{context}\n\nRispondi in italiano.")
 ])
 
 @st.cache_resource(show_spinner=False)
-def get_llm(temperature: float) -> ChatOpenAI:
+def get_llm(temperature: float):
     return ChatOpenAI(api_key=OPENAI_API_KEY, model="gpt-4o-mini", temperature=temperature)
 
-# ------------------------- Utility -------------------------
+# ============================
+# Utilità
+# ============================
 def format_docs(docs: List[Document]) -> str:
     blocks = []
     for i, d in enumerate(docs, start=1):
@@ -79,10 +94,7 @@ def format_docs(docs: List[Document]) -> str:
 
 @st.cache_resource(show_spinner=False)
 def load_vectorstore(persist_directory: str) -> Chroma:
-    """
-    Apre una persistenza Chroma già esistente, senza scrivere nulla.
-    Path risolto relativo al file dell'app (funziona su Streamlit Cloud).
-    """
+    """Apre la persistenza Chroma esistente in sola lettura."""
     base_dir = Path(__file__).parent.resolve()
     persist_path = (base_dir / persist_directory).resolve()
 
@@ -93,25 +105,104 @@ def load_vectorstore(persist_directory: str) -> Chroma:
         )
 
     embeddings = OpenAIEmbeddings(api_key=OPENAI_API_KEY, model="text-embedding-3-large")
-
-    client_settings = ChromaSettings(
-        anonymized_telemetry=False,
-        is_persistent=True,
-        persist_directory=str(persist_path),
-    )
-
-    # solo apertura in lettura; se il DB non è compatibile, il sanity-check fallirà
-    vs = Chroma(
-        persist_directory=str(persist_path),
-        embedding_function=embeddings,
-        client_settings=client_settings,
-    )
-
-    # sanity check minimale
-    _ = vs.similarity_search("test", k=1)
+    try:
+        vs = Chroma(
+            persist_directory=str(persist_path),
+            embedding_function=embeddings,
+        )
+        # sanity check rapido
+        _ = vs.similarity_search("test", k=1)
+    except Exception as e:
+        raise RuntimeError(f"Errore nell'aprire la persistenza Chroma in '{persist_path}': {e}")
     return vs
 
-# ------------------------- Carica DB e costruisci retriever -------------------------
+def _avg_len(texts: List[str]) -> float:
+    if not texts:
+        return 0.0
+    return sum(len(t or "") for t in texts) / len(texts)
+
+@st.cache_resource(show_spinner=False)
+def index_health_check(_retriever) -> float:
+    """Valuta media caratteri nei chunk recuperati da una probe query."""
+    try:
+        # prova a chiedere più risultati
+        docs = _retriever.get_relevant_documents("probe query")
+        return _avg_len([d.page_content for d in docs])
+    except Exception:
+        return 0.0
+
+def keyword_tokens(q: str) -> list[str]:
+    q = (q or "").lower()
+    base = [t.strip() for t in q.replace(",", " ").split() if t.strip()]
+    extra = []
+    if "script" in q:
+        extra += ["scripts", "script crm", "script di chiamata", "script telefonico"]
+    return list(dict.fromkeys(base + extra))
+
+def keyword_boost(query: str, docs: List[Document], top: int = 8) -> List[Document]:
+    toks = keyword_tokens(query)
+    if not toks:
+        return docs
+    scored = []
+    for d in docs:
+        txt = (d.page_content or "").lower()
+        hit = any(t in txt for t in toks)
+        scored.append((1 if hit else 0, len(txt), d))
+    # prima chi ha match keyword, poi quelli con più testo
+    scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    ordered = [d for _, _, d in scored]
+    # porta in alto i migliori 'top', poi il resto
+    head = ordered[:top]
+    tail = [d for d in ordered if d not in head]
+    return head + tail
+
+def retrieve_with_boost(query: str, base_retriever, k_expand: int = 40) -> List[Document]:
+    # 1) prima passata (MMR già configurato su retriever)
+    try:
+        docs = base_retriever.get_relevant_documents(query)
+    except AttributeError:
+        docs = base_retriever.invoke(query)
+
+    docs = keyword_boost(query, docs, top=12)
+
+    have_keyword = any(
+        any(t in (d.page_content or "").lower() for t in keyword_tokens(query)) for d in docs
+    )
+    poor_text = _avg_len([d.page_content for d in docs]) < 80
+
+    # 2) se poveri o senza match lessicale -> MultiQuery
+    if not have_keyword or poor_text:
+        try:
+            mq = MultiQueryRetriever.from_llm(
+                retriever=base_retriever,
+                llm=ChatOpenAI(api_key=OPENAI_API_KEY, model="gpt-4o-mini", temperature=0.0)
+            )
+            more = mq.get_relevant_documents(query)
+            # unisci e deduplica
+            seen = set()
+            merged = []
+            for d in (docs + more):
+                key = (d.metadata.get("source"), d.metadata.get("page"), (d.page_content or "")[:80])
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged.append(d)
+            docs = keyword_boost(query, merged[:k_expand], top=12)
+        except Exception:
+            pass
+
+    # 3) fallback “deep” se ancora poveri
+    if _avg_len([d.page_content for d in docs]) < 80:
+        try:
+            deep = base_retriever.vectorstore.similarity_search(query, k=max(k_expand, 50))
+            docs = keyword_boost(query, deep, top=12)
+        except Exception:
+            pass
+    return docs
+
+# ============================
+# Caricamento Vectorstore & Retriever
+# ============================
 with st.spinner("Carico il DB Chroma esistente…"):
     try:
         vectorstore = load_vectorstore(persist_dir_input)
@@ -119,15 +210,30 @@ with st.spinner("Carico il DB Chroma esistente…"):
         st.error(str(e))
         st.stop()
 
-retriever = vectorstore.as_retriever(search_kwargs={"k": k})
+# retriever MMR (diversificazione risultati)
+retriever = vectorstore.as_retriever(
+    search_type="mmr",
+    search_kwargs={"k": max(12, k), "lambda_mult": 0.2},
+)
 
-# ------------------------- Chat UI -------------------------
+# Health check indice
+avg_chars = index_health_check(retriever)
+if avg_chars < 80:
+    st.warning(
+        "⚠️ L’indice Chroma sembra contenere chunk con poco testo (media < 80 caratteri). "
+        "Se il PDF è scanner/immagine o l’estrazione è fallita, valuta **re-indicizzazione con OCR**. "
+        "In ogni caso ho attivato query expander + keyword boost per aumentare il recall."
+    )
+
+# ============================
+# Chat UI
+# ============================
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
 user_q = st.chat_input("Fai una domanda sul PDF indicizzato…")
 
-# Storia a schermo
+# cronologia visiva
 for role, content in st.session_state.messages:
     with st.chat_message(role):
         st.markdown(content)
@@ -138,37 +244,36 @@ if user_q:
         st.markdown(user_q)
 
     with st.chat_message("assistant"):
-        # 1) Recupero contesto
         with st.spinner("Recupero contesto…"):
-            docs = retriever.get_relevant_documents(user_q)
-        context = format_docs(docs)
+            docs = retrieve_with_boost(user_q, retriever, k_expand=40)
 
-        # 2) Chiamata LLM
+        if not docs:
+            st.write("Non ho trovato passaggi pertinenti nell'indice.")
+            st.stop()
+
+        context = format_docs(docs)
         llm = get_llm(temperature)
-        msg = PROMPT_TEMPLATE.format_messages(question=user_q, context=context)
+        msg = PROMPT_TMPL.format_messages(question=user_q, context=context)
+
         with st.spinner("Genero la risposta…"):
             resp = llm.invoke(msg)
         answer = resp.content
-
-        # 3) Output
         st.markdown(answer)
 
-        # 4) Citazioni / estratti
         with st.expander("Mostra estratti e citazioni"):
             for i, d in enumerate(docs, start=1):
-                meta = d.metadata or {}
-                src = meta.get("source") or meta.get("file_path") or "sorgente"
-                page = meta.get("page") or meta.get("page_number")
+                md = d.metadata or {}
+                src = md.get("source") or md.get("file_path") or "sorgente"
+                page = md.get("page") or md.get("page_number")
                 label = f"[{i}] {src}" + (f" — p.{page}" if page is not None else "")
-                st.markdown(f"**{label}**")
-                st.write(d.page_content)
-                st.write("—")
+                preview = (d.page_content or "").strip()
+                if not preview:
+                    preview = "_(chunk vuoto)_"
+                st.markdown(f"**{label}**\n\n{preview}\n")
 
-        # aggiorna history
         st.session_state.messages.append(("assistant", answer))
 
-# ------------------------- Footer -------------------------
 st.caption(
     "🔎 Retrieval via Chroma (persist_directory). Nessuna reindicizzazione in runtime. "
-    "Assicurati che la cartella contenga l'indice costruito con lo stesso modello di embedding."
+    "Assicurati che la cartella contenga l’indice costruito con lo stesso modello di embedding."
 )
