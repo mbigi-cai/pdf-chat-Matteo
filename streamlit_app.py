@@ -1,10 +1,13 @@
+
+os.environ["ANONYMIZED_TELEMETRY"] = "False"
 import os
 from pathlib import Path
 from typing import List
 
 import streamlit as st
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from langchain_community.vectorstores import Chroma
+from langchain_chroma import Chroma
+from chromadb.config import Settings as ChromaSettings
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.documents import Document
 
@@ -73,13 +76,8 @@ def format_docs(docs: List[Document]) -> str:
         blocks.append(f"{tag}:\n{d.page_content}")
     return "\n\n".join(blocks)
 
-# ---- Caricamento del vectorstore (SOLO LETTURA)
 @st.cache_resource(show_spinner=False)
 def load_vectorstore(persist_directory: str):
-    """
-    Apre una persistenza Chroma già esistente, senza scrivere nulla.
-    Il path è risolto relativo al file dell'app per funzionare su Streamlit Cloud.
-    """
     base_dir = Path(__file__).parent.resolve()
     persist_path = (base_dir / persist_directory).resolve()
 
@@ -89,9 +87,25 @@ def load_vectorstore(persist_directory: str):
             "Verifica che sia presente nel repository (o aggiorna il nome in sidebar)."
         )
 
-    embeddings = OpenAIEmbeddings(api_key=OPENAI_API_KEY, model="text-embedding-3-large")
+    # Embedding: deve essere lo stesso usato per creare l'indice
+    embeddings = OpenAIEmbeddings(
+        api_key=OPENAI_API_KEY,
+        model="text-embedding-3-large"
+    )
+
+    # Client settings: persistenza + telemetria OFF
+    client_settings = ChromaSettings(
+        anonymized_telemetry=False,
+        is_persistent=True,
+        persist_directory=str(persist_path),
+    )
+
     try:
-        vs = Chroma(persist_directory=str(persist_path), embedding_function=embeddings)
+        vs = Chroma(
+            persist_directory=str(persist_path),
+            embedding_function=embeddings,
+            client_settings=client_settings,
+        )
         # sanity check
         _ = vs.similarity_search("test", k=1)
     except Exception as e:
@@ -100,14 +114,6 @@ def load_vectorstore(persist_directory: str):
         )
     return vs
 
-with st.spinner("Carico il DB Chroma esistente…"):
-    try:
-        vectorstore = load_vectorstore(persist_dir_input)
-    except Exception as e:
-        st.error(str(e))
-        st.stop()
-
-retriever = vectorstore.as_retriever(search_kwargs={"k": k})
 
 # ---- Chat UI
 if "messages" not in st.session_state:
