@@ -1,0 +1,11 @@
+{
+  "pdf_name": "doc.pdf",
+  "pdf_hash": "0d58a67c1cd9a1d659f4e81f78f1b901c171f520adb083e44c264f945e7e3940",
+  "embed_model": "text-embedding-3-large",
+  "chunk_size": 1000,
+  "chunk_overlap": 150,
+  "use_ocr": true,
+  "ocr_lang": "ita+eng",
+  "ocr_dpi": 220,
+  "min_chars_per_page": 80
+}

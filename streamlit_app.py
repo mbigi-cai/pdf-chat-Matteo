@@ -51,7 +51,7 @@ if not OPENAI_API_KEY:
 # ============================
 # UI e impostazioni
 # ============================
-DEFAULT_CHROMA_DIR = "chroma_db_v2_text_embedding_3_large_single"  # <-- nome cartella nel repo
+DEFAULT_CHROMA_DIR = "chroma_db_text_embedding_3_large_single"  # <-- nome cartella nel repo
 
 with st.sidebar:
     st.header("⚙️ Impostazioni")
